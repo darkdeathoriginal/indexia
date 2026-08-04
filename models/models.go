@@ -56,7 +56,9 @@ type ChannelMessage struct {
 
 type FooterMessage struct {
 	ID            uint      `gorm:"primaryKey" json:"id"`
-	Content       string    `gorm:"not null" json:"content"`
+	MessageType   string    `gorm:"default:'text'" json:"message_type"` // "text", "sticker", "photo", "video", "animation", "document", "audio", "voice"
+	FileID        string    `json:"file_id"`
+	Content       string    `json:"content"` // HTML text or media caption
 	OrderIndex    int       `gorm:"not null" json:"order_index"`
 	TelegramMsgID int       `gorm:"default:0" json:"telegram_msg_id"`
 	CreatedAt     time.Time `json:"created_at"`

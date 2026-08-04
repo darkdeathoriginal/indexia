@@ -48,7 +48,6 @@ func (s *SyncService) SyncChannel(channelIDStr string) error {
 	defer s.syncMutex.Unlock()
 
 	if channelIDStr == "" {
-		// Try fetching from settings
 		var setting models.Setting
 		if err := s.db.First(&setting, "key = ?", "channel_id").Error; err != nil {
 			return fmt.Errorf("channel ID not configured. Use /setchannel <channel_id_or_username>")
@@ -77,32 +76,12 @@ func (s *SyncService) SyncChannel(channelIDStr string) error {
 	}
 
 	// Build prepared pages for alphabets
-	var pages []PreparedPage
-
+	var alphabetPages []PreparedPage
 	for _, letter := range alphabetOrder {
 		items := grouped[letter]
 		letterPages := s.buildAlphabetPages(letter, items)
-		pages = append(pages, letterPages...)
+		alphabetPages = append(alphabetPages, letterPages...)
 	}
-
-	// Fetch footer messages
-	var footers []models.FooterMessage
-	if err := s.db.Order("order_index ASC").Find(&footers).Error; err != nil {
-		return fmt.Errorf("failed to fetch footers: %w", err)
-	}
-
-	var footerPages []PreparedPage
-	for idx, footer := range footers {
-		footerPages = append(footerPages, PreparedPage{
-			Type:     "footer",
-			Alphabet: "",
-			Part:     idx + 1,
-			Content:  footer.Content,
-		})
-	}
-
-	// Total required pages = Alphabet Pages + Footer Pages
-	allRequiredPages := append(pages, footerPages...)
 
 	// Fetch existing channel message tracking from DB
 	var existingMsgs []models.ChannelMessage
@@ -110,43 +89,23 @@ func (s *SyncService) SyncChannel(channelIDStr string) error {
 		return fmt.Errorf("failed to fetch channel message records: %w", err)
 	}
 
-	log.Printf("Syncing channel %d: %d required pages (%d alphabet, %d footer), %d existing messages in DB",
-		channelID, len(allRequiredPages), len(pages), len(footerPages), len(existingMsgs))
-
-	// Check if cascading is required
-	// If alphabet page count expanded and footers exist, existing footer messages at bottom MUST be deleted from Telegram
-	// and re-created at the bottom after alphabet pages.
-	alphabetPageCount := len(pages)
-	prevAlphabetMsgCount := 0
-	hasExistingFooters := false
-
+	// Always delete existing Telegram footer messages to ensure footers stay cleanly at the very bottom
 	for _, m := range existingMsgs {
-		if m.MessageType == "alphabet" {
-			prevAlphabetMsgCount++
-		} else if m.MessageType == "footer" {
-			hasExistingFooters = true
+		if m.MessageType == "footer" {
+			s.deleteTelegramMessage(channelID, m.MessageID)
 		}
 	}
+	s.db.Where("channel_id = ? AND message_type = ?", channelID, "footer").Delete(&models.ChannelMessage{})
 
-	needsCascading := prevAlphabetMsgCount > 0 && alphabetPageCount > prevAlphabetMsgCount && hasExistingFooters
+	// Re-fetch existing msgs (now only alphabet msgs)
+	s.db.Where("channel_id = ?", channelID).Order("order_index ASC").Find(&existingMsgs)
 
-	if needsCascading {
-		log.Println("Cascading triggered: Alphabet page count increased. Deleting existing footer messages to re-post at bottom.")
-		for _, m := range existingMsgs {
-			if m.MessageType == "footer" {
-				s.deleteTelegramMessage(channelID, m.MessageID)
-			}
-		}
-		s.db.Where("channel_id = ? AND message_type = ?", channelID, "footer").Delete(&models.ChannelMessage{})
-		s.db.Where("channel_id = ?", channelID).Order("order_index ASC").Find(&existingMsgs)
-	}
+	// Adjust total alphabet message count in Telegram
+	reqAlphabetCount := len(alphabetPages)
+	currentAlphabetCount := len(existingMsgs)
 
-	// Adjust total message count in Telegram to match allRequiredPages count
-	reqCount := len(allRequiredPages)
-	currentCount := len(existingMsgs)
-
-	if reqCount > currentCount {
-		needed := reqCount - currentCount
+	if reqAlphabetCount > currentAlphabetCount {
+		needed := reqAlphabetCount - currentAlphabetCount
 		log.Printf("Posting %d new message(s) to Telegram channel to expand capacity...", needed)
 
 		for i := 0; i < needed; i++ {
@@ -160,37 +119,35 @@ func (s *SyncService) SyncChannel(channelIDStr string) error {
 			newMsgRecord := models.ChannelMessage{
 				ChannelID:   channelID,
 				MessageID:   sentMsg.MessageID,
-				MessageType: "placeholder",
-				OrderIndex:  currentCount + i,
+				MessageType: "alphabet",
+				OrderIndex:  currentAlphabetCount + i,
 				ContentHash: "",
 			}
 			s.db.Create(&newMsgRecord)
 			existingMsgs = append(existingMsgs, newMsgRecord)
-			
-			// Respect Telegram channel post rate limit (~20 posts/min)
 			time.Sleep(ChannelPostDelay)
 		}
-	} else if reqCount < currentCount {
-		surplusCount := currentCount - reqCount
+	} else if reqAlphabetCount < currentAlphabetCount {
+		surplusCount := currentAlphabetCount - reqAlphabetCount
 		log.Printf("Deleting %d surplus message(s) from Telegram channel...", surplusCount)
 
-		for i := currentCount - 1; i >= reqCount; i-- {
+		for i := currentAlphabetCount - 1; i >= reqAlphabetCount; i-- {
 			msgToDelete := existingMsgs[i]
 			s.deleteTelegramMessage(channelID, msgToDelete.MessageID)
 			s.db.Delete(&msgToDelete)
 			time.Sleep(ChannelEditDelay)
 		}
-		existingMsgs = existingMsgs[:reqCount]
+		existingMsgs = existingMsgs[:reqAlphabetCount]
 	}
 
-	// Update all channel messages with current page contents
-	for idx, page := range allRequiredPages {
+	// Update all alphabet channel messages with current page contents
+	for idx, page := range alphabetPages {
 		hash := hashContent(page.Content)
 		msgRecord := &existingMsgs[idx]
 
 		if msgRecord.ContentHash != hash || msgRecord.MessageType != page.Type || msgRecord.Alphabet != page.Alphabet || msgRecord.Part != page.Part {
-			log.Printf("Updating message %d (Index %d/%d, Type: %s, Alphabet: %s, Part: %d)...",
-				msgRecord.MessageID, idx+1, len(allRequiredPages), page.Type, page.Alphabet, page.Part)
+			log.Printf("Updating alphabet message %d (Index %d/%d, Alphabet: %s, Part: %d)...",
+				msgRecord.MessageID, idx+1, len(alphabetPages), page.Alphabet, page.Part)
 
 			editMsg := tgbotapi.NewEditMessageText(channelID, msgRecord.MessageID, page.Content)
 			editMsg.ParseMode = "HTML"
@@ -210,8 +167,108 @@ func (s *SyncService) SyncChannel(channelIDStr string) error {
 		}
 	}
 
+	// Fetch all footer messages from DB and post them at the very bottom of the channel
+	var footers []models.FooterMessage
+	if err := s.db.Order("order_index ASC").Find(&footers).Error; err != nil {
+		log.Printf("Error fetching footers: %v", err)
+	}
+
+	log.Printf("Posting %d footer message(s) at bottom of channel...", len(footers))
+	for idx, footer := range footers {
+		sentMsg, err := s.sendFooterTelegramMessage(channelID, footer)
+		if err != nil {
+			log.Printf("Error sending footer #%d (type: %s): %v", footer.ID, footer.MessageType, err)
+			continue
+		}
+
+		footer.TelegramMsgID = sentMsg.MessageID
+		s.db.Save(&footer)
+
+		footerRecord := models.ChannelMessage{
+			ChannelID:   channelID,
+			MessageID:   sentMsg.MessageID,
+			MessageType: "footer",
+			OrderIndex:  reqAlphabetCount + idx,
+			ContentHash: hashContent(footer.Content + footer.FileID),
+		}
+		s.db.Create(&footerRecord)
+		time.Sleep(ChannelPostDelay)
+	}
+
 	log.Println("Channel sync completed successfully.")
 	return nil
+}
+
+func (s *SyncService) sendFooterTelegramMessage(channelID int64, footer models.FooterMessage) (tgbotapi.Message, error) {
+	var chattable tgbotapi.Chattable
+
+	switch footer.MessageType {
+	case "sticker":
+		msg := tgbotapi.NewSticker(channelID, tgbotapi.FileID(footer.FileID))
+		chattable = msg
+	case "photo":
+		msg := tgbotapi.NewPhoto(channelID, tgbotapi.FileID(footer.FileID))
+		if footer.Content != "" {
+			msg.Caption = footer.Content
+			msg.ParseMode = "HTML"
+		}
+		chattable = msg
+	case "video":
+		msg := tgbotapi.NewVideo(channelID, tgbotapi.FileID(footer.FileID))
+		if footer.Content != "" {
+			msg.Caption = footer.Content
+			msg.ParseMode = "HTML"
+		}
+		chattable = msg
+	case "animation":
+		msg := tgbotapi.NewAnimation(channelID, tgbotapi.FileID(footer.FileID))
+		if footer.Content != "" {
+			msg.Caption = footer.Content
+			msg.ParseMode = "HTML"
+		}
+		chattable = msg
+	case "document":
+		msg := tgbotapi.NewDocument(channelID, tgbotapi.FileID(footer.FileID))
+		if footer.Content != "" {
+			msg.Caption = footer.Content
+			msg.ParseMode = "HTML"
+		}
+		chattable = msg
+	case "audio":
+		msg := tgbotapi.NewAudio(channelID, tgbotapi.FileID(footer.FileID))
+		if footer.Content != "" {
+			msg.Caption = footer.Content
+			msg.ParseMode = "HTML"
+		}
+		chattable = msg
+	case "voice":
+		msg := tgbotapi.NewVoice(channelID, tgbotapi.FileID(footer.FileID))
+		if footer.Content != "" {
+			msg.Caption = footer.Content
+			msg.ParseMode = "HTML"
+		}
+		chattable = msg
+	default: // "text"
+		msg := tgbotapi.NewMessage(channelID, footer.Content)
+		msg.ParseMode = "HTML"
+		msg.DisableWebPagePreview = true
+		chattable = msg
+	}
+
+	for retries := 0; retries < 10; retries++ {
+		msg, err := s.bot.Send(chattable)
+		if err != nil {
+			if strings.Contains(err.Error(), "Too Many Requests") || strings.Contains(err.Error(), "429") {
+				delay := getRetryDelay(err, retries)
+				log.Printf("⚠️ Rate limited by Telegram sending footer. Waiting %v before retry %d/10...", delay, retries+1)
+				time.Sleep(delay)
+				continue
+			}
+			return msg, err
+		}
+		return msg, nil
+	}
+	return tgbotapi.Message{}, fmt.Errorf("failed after 10 rate limit retries")
 }
 
 func (s *SyncService) buildAlphabetPages(letter string, entries []models.Entry) []PreparedPage {

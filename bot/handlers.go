@@ -49,6 +49,10 @@ func (b *Bot) handleUpdate(update tgbotapi.Update) {
 			b.handleListAdmins(msg, user)
 		case "addfooter", "setfooter":
 			b.handleAddFooter(msg, user)
+		case "listfooters", "footers":
+			b.handleListFooters(msg, user)
+		case "delfooter", "deletefooter":
+			b.handleDeleteFooter(msg, user)
 		case "clearfooters":
 			b.handleClearFooters(msg, user)
 		case "sync":
@@ -77,7 +81,6 @@ func (b *Bot) ensureUser(from *tgbotapi.User) (*models.User, bool) {
 	justPromoted := false
 
 	if err != nil {
-		// User does not exist in DB yet
 		var adminCount int64
 		b.db.Model(&models.User{}).Where("is_admin = ?", true).Count(&adminCount)
 
@@ -92,7 +95,6 @@ func (b *Bot) ensureUser(from *tgbotapi.User) (*models.User, bool) {
 		b.db.Create(&user)
 		justPromoted = isAdmin
 	} else {
-		// Update username/firstname if changed
 		if user.Username != from.UserName || user.FirstName != from.FirstName {
 			user.Username = from.UserName
 			user.FirstName = from.FirstName
@@ -118,7 +120,9 @@ func (b *Bot) handleHelp(msg *tgbotapi.Message, user *models.User) {
 
 <b>Channel & Footer Settings:</b>
 • <code>/setchannel &lt;ChannelID&gt;</code> - Set channel ID (e.g. -1001234567890)
-• <code>/addfooter &lt;text&gt;</code> - Add footer message (or reply to a message with /addfooter)
+• <code>/addfooter &lt;text&gt;</code> - Add footer (or reply to text/sticker/photo/video with /addfooter)
+• <code>/listfooters</code> - List all active footer messages
+• <code>/delfooter &lt;ID&gt;</code> - Delete specific footer message by ID
 • <code>/clearfooters</code> - Clear all footer messages
 • <code>/sync</code> - Force trigger channel update & cascading sync
 
@@ -160,7 +164,6 @@ func (b *Bot) handleAddInline(msg *tgbotapi.Message, user *models.User, text str
 		return
 	}
 
-	// Validate URL format
 	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") && !strings.HasPrefix(rawURL, "t.me/") {
 		rawURL = "https://" + rawURL
 	}
@@ -188,7 +191,6 @@ func (b *Bot) handleAddInline(msg *tgbotapi.Message, user *models.User, text str
 	b.replyHTML(msg.Chat.ID, fmt.Sprintf("✅ <b>Entry Added!</b>\n\n<b>ID:</b> %d\n<b>Name:</b> %s\n<b>Letter:</b> %s\n<b>URL:</b> %s\n\n<i>Syncing channel...</i>",
 		entry.ID, html.EscapeString(entry.Name), entry.FirstLetter, html.EscapeString(entry.URL)))
 
-	// Automatically sync channel
 	go func() {
 		if err := b.syncSvc.SyncChannel(b.cfg.ChannelID); err != nil {
 			log.Printf("Auto-sync error after add: %v", err)
@@ -310,7 +312,6 @@ func (b *Bot) handleAddAdmin(msg *tgbotapi.Message, user *models.User) {
 	}
 
 	if err != nil {
-		// Create placeholder user record
 		if id, parseErr := strconv.ParseInt(cleanArg, 10, 64); parseErr == nil {
 			targetUser = models.User{TelegramID: id, IsAdmin: true}
 			b.db.Create(&targetUser)
@@ -396,19 +397,75 @@ func (b *Bot) handleAddFooter(msg *tgbotapi.Message, user *models.User) {
 		return
 	}
 
-	text := strings.TrimSpace(msg.CommandArguments())
+	inlineArgs := strings.TrimSpace(msg.CommandArguments())
 
-	// If no inline argument, extract content from replied message if present
-	if text == "" && msg.ReplyToMessage != nil {
-		text = extractHTMLFromMessage(msg.ReplyToMessage)
+	footerType := "text"
+	fileID := ""
+	content := ""
+
+	if msg.ReplyToMessage != nil {
+		reply := msg.ReplyToMessage
+		if reply.Sticker != nil {
+			footerType = "sticker"
+			fileID = reply.Sticker.FileID
+			content = inlineArgs
+		} else if len(reply.Photo) > 0 {
+			footerType = "photo"
+			fileID = reply.Photo[len(reply.Photo)-1].FileID
+			content = inlineArgs
+			if content == "" {
+				content = extractHTMLFromMessage(reply)
+			}
+		} else if reply.Video != nil {
+			footerType = "video"
+			fileID = reply.Video.FileID
+			content = inlineArgs
+			if content == "" {
+				content = extractHTMLFromMessage(reply)
+			}
+		} else if reply.Animation != nil {
+			footerType = "animation"
+			fileID = reply.Animation.FileID
+			content = inlineArgs
+			if content == "" {
+				content = extractHTMLFromMessage(reply)
+			}
+		} else if reply.Document != nil {
+			footerType = "document"
+			fileID = reply.Document.FileID
+			content = inlineArgs
+			if content == "" {
+				content = extractHTMLFromMessage(reply)
+			}
+		} else if reply.Audio != nil {
+			footerType = "audio"
+			fileID = reply.Audio.FileID
+			content = inlineArgs
+			if content == "" {
+				content = extractHTMLFromMessage(reply)
+			}
+		} else if reply.Voice != nil {
+			footerType = "voice"
+			fileID = reply.Voice.FileID
+			content = inlineArgs
+			if content == "" {
+				content = extractHTMLFromMessage(reply)
+			}
+		} else {
+			footerType = "text"
+			if inlineArgs != "" {
+				content = inlineArgs
+			} else {
+				content = extractHTMLFromMessage(reply)
+			}
+		}
+	} else if inlineArgs != "" {
+		footerType = "text"
+		content = inlineArgs
 	}
 
-	if text == "" {
-		if msg.ReplyToMessage != nil {
-			b.replyHTML(msg.Chat.ID, "❌ <b>The replied message contains no text, caption, or emoji to use as a footer.</b>")
-		} else {
-			b.replyHTML(msg.Chat.ID, "⚠️ <b>Usage:</b>\n• <code>/addfooter Your footer text here</code>\n• Or reply to any message containing text/caption with <code>/addfooter</code>")
-		}
+	if footerType == "text" && content == "" {
+		b.replyHTML(msg.Chat.ID, "⚠️ <b>Usage:</b>\n• <code>/addfooter Your footer text here</code>\n• Reply to any sticker, photo, video, GIF, file, or message with <code>/addfooter</code>")
 		return
 	}
 
@@ -416,16 +473,86 @@ func (b *Bot) handleAddFooter(msg *tgbotapi.Message, user *models.User) {
 	b.db.Model(&models.FooterMessage{}).Count(&count)
 
 	footer := models.FooterMessage{
-		Content:    text,
-		OrderIndex: int(count),
+		MessageType: footerType,
+		FileID:      fileID,
+		Content:     content,
+		OrderIndex:  int(count),
 	}
 	b.db.Create(&footer)
 
-	b.replyHTML(msg.Chat.ID, fmt.Sprintf("📌 <b>Footer message added!</b>\n\n<b>Content preview:</b>\n%s\n\n<i>Syncing channel and re-positioning footers at bottom...</i>", text))
+	previewText := fmt.Sprintf("📌 <b>Footer #%d Added!</b>\n<b>Type:</b> <code>%s</code>", footer.ID, strings.ToUpper(footerType))
+	if content != "" {
+		previewText += fmt.Sprintf("\n<b>Content/Caption:</b>\n%s", content)
+	}
+	previewText += "\n\n<i>Syncing channel and posting footers at bottom...</i>"
+
+	b.replyHTML(msg.Chat.ID, previewText)
 
 	go func() {
 		if err := b.syncSvc.SyncChannel(b.cfg.ChannelID); err != nil {
 			log.Printf("Sync error after adding footer: %v", err)
+		}
+	}()
+}
+
+func (b *Bot) handleListFooters(msg *tgbotapi.Message, user *models.User) {
+	if !user.IsAdmin {
+		b.replyText(msg.Chat.ID, "❌ Permission denied.")
+		return
+	}
+
+	var footers []models.FooterMessage
+	b.db.Order("order_index ASC").Find(&footers)
+
+	if len(footers) == 0 {
+		b.replyText(msg.Chat.ID, "📭 No footer messages saved.")
+		return
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("📌 <b>Active Footer Messages (%d):</b>\n\n", len(footers)))
+
+	for _, f := range footers {
+		preview := f.Content
+		if preview == "" && f.FileID != "" {
+			preview = "[Media Content]"
+		}
+		sb.WriteString(fmt.Sprintf("• <b>[#%d]</b> <i>(%s)</i>: %s\n", f.ID, strings.ToUpper(f.MessageType), preview))
+	}
+
+	b.replyHTML(msg.Chat.ID, sb.String())
+}
+
+func (b *Bot) handleDeleteFooter(msg *tgbotapi.Message, user *models.User) {
+	if !user.IsAdmin {
+		b.replyText(msg.Chat.ID, "❌ Permission denied.")
+		return
+	}
+
+	args := strings.TrimSpace(msg.CommandArguments())
+	if args == "" {
+		b.replyHTML(msg.Chat.ID, "⚠️ <b>Usage:</b> <code>/delfooter &lt;ID&gt;</code> (use /listfooters to see IDs)")
+		return
+	}
+
+	id, err := strconv.ParseUint(args, 10, 64)
+	if err != nil {
+		b.replyText(msg.Chat.ID, "❌ Invalid footer ID.")
+		return
+	}
+
+	var footer models.FooterMessage
+	if err := b.db.First(&footer, id).Error; err != nil {
+		b.replyText(msg.Chat.ID, fmt.Sprintf("❌ Footer #%d not found.", id))
+		return
+	}
+
+	b.db.Delete(&footer)
+	b.replyHTML(msg.Chat.ID, fmt.Sprintf("🗑️ <b>Footer #%d deleted.</b> Syncing channel...", id))
+
+	go func() {
+		if err := b.syncSvc.SyncChannel(b.cfg.ChannelID); err != nil {
+			log.Printf("Sync error after deleting footer: %v", err)
 		}
 	}()
 }
@@ -440,13 +567,6 @@ func extractHTMLFromMessage(msg *tgbotapi.Message) string {
 	if rawText == "" {
 		rawText = msg.Caption
 		entities = msg.CaptionEntities
-	}
-
-	if rawText == "" && msg.Sticker != nil {
-		if msg.Sticker.Emoji != "" {
-			return msg.Sticker.Emoji
-		}
-		return "🎨 [Sticker]"
 	}
 
 	if rawText == "" {
