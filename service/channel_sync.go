@@ -89,21 +89,41 @@ func (s *SyncService) SyncChannel(channelIDStr string) error {
 		return fmt.Errorf("failed to fetch channel message records: %w", err)
 	}
 
-	// Always delete existing Telegram footer messages to ensure footers stay cleanly at the very bottom
+	// Separate existing tracked messages into alphabet messages and footer messages
+	var alphabetMsgs []models.ChannelMessage
+	var footerMsgs []models.ChannelMessage
+
 	for _, m := range existingMsgs {
 		if m.MessageType == "footer" {
-			s.deleteTelegramMessage(channelID, m.MessageID)
+			footerMsgs = append(footerMsgs, m)
+		} else {
+			alphabetMsgs = append(alphabetMsgs, m)
 		}
 	}
-	s.db.Where("channel_id = ? AND message_type = ?", channelID, "footer").Delete(&models.ChannelMessage{})
 
-	// Re-fetch existing msgs (now only alphabet msgs)
-	s.db.Where("channel_id = ?", channelID).Order("order_index ASC").Find(&existingMsgs)
+	reqAlphabetCount := len(alphabetPages)
+	currentAlphabetCount := len(alphabetMsgs)
+
+	var footers []models.FooterMessage
+	if err := s.db.Order("order_index ASC").Find(&footers).Error; err != nil {
+		log.Printf("Error fetching footers: %v", err)
+	}
+
+	// Cascading / Footer Re-post Trigger:
+	// Only delete and re-post footers if:
+	// 1. Alphabet message count changed (cascading happened!)
+	// 2. OR number of footer messages changed (a footer was added/deleted)
+	needsFooterRepost := (reqAlphabetCount != currentAlphabetCount) || (len(footerMsgs) != len(footers))
+
+	if needsFooterRepost && len(footerMsgs) > 0 {
+		log.Println("Cascading / Footer change detected: Deleting existing footer messages to re-post at bottom.")
+		for _, m := range footerMsgs {
+			s.deleteTelegramMessage(channelID, m.MessageID)
+		}
+		s.db.Where("channel_id = ? AND message_type = ?", channelID, "footer").Delete(&models.ChannelMessage{})
+	}
 
 	// Adjust total alphabet message count in Telegram
-	reqAlphabetCount := len(alphabetPages)
-	currentAlphabetCount := len(existingMsgs)
-
 	if reqAlphabetCount > currentAlphabetCount {
 		needed := reqAlphabetCount - currentAlphabetCount
 		log.Printf("Posting %d new message(s) to Telegram channel to expand capacity...", needed)
@@ -124,7 +144,7 @@ func (s *SyncService) SyncChannel(channelIDStr string) error {
 				ContentHash: "",
 			}
 			s.db.Create(&newMsgRecord)
-			existingMsgs = append(existingMsgs, newMsgRecord)
+			alphabetMsgs = append(alphabetMsgs, newMsgRecord)
 			time.Sleep(ChannelPostDelay)
 		}
 	} else if reqAlphabetCount < currentAlphabetCount {
@@ -132,18 +152,18 @@ func (s *SyncService) SyncChannel(channelIDStr string) error {
 		log.Printf("Deleting %d surplus message(s) from Telegram channel...", surplusCount)
 
 		for i := currentAlphabetCount - 1; i >= reqAlphabetCount; i-- {
-			msgToDelete := existingMsgs[i]
+			msgToDelete := alphabetMsgs[i]
 			s.deleteTelegramMessage(channelID, msgToDelete.MessageID)
 			s.db.Delete(&msgToDelete)
 			time.Sleep(ChannelEditDelay)
 		}
-		existingMsgs = existingMsgs[:reqAlphabetCount]
+		alphabetMsgs = alphabetMsgs[:reqAlphabetCount]
 	}
 
 	// Update all alphabet channel messages with current page contents
 	for idx, page := range alphabetPages {
 		hash := hashContent(page.Content)
-		msgRecord := &existingMsgs[idx]
+		msgRecord := &alphabetMsgs[idx]
 
 		if msgRecord.ContentHash != hash || msgRecord.MessageType != page.Type || msgRecord.Alphabet != page.Alphabet || msgRecord.Part != page.Part {
 			log.Printf("Updating alphabet message %d (Index %d/%d, Alphabet: %s, Part: %d)...",
@@ -167,32 +187,33 @@ func (s *SyncService) SyncChannel(channelIDStr string) error {
 		}
 	}
 
-	// Fetch all footer messages from DB and post them at the very bottom of the channel
-	var footers []models.FooterMessage
-	if err := s.db.Order("order_index ASC").Find(&footers).Error; err != nil {
-		log.Printf("Error fetching footers: %v", err)
-	}
+	// Re-post footer messages ONLY when cascading happened or footers changed/don't exist
+	if needsFooterRepost || len(footerMsgs) == 0 {
+		if len(footers) > 0 {
+			log.Printf("Posting %d footer message(s) at bottom of channel...", len(footers))
+			for idx, footer := range footers {
+				sentMsg, err := s.sendFooterTelegramMessage(channelID, footer)
+				if err != nil {
+					log.Printf("Error sending footer #%d (type: %s): %v", footer.ID, footer.MessageType, err)
+					continue
+				}
 
-	log.Printf("Posting %d footer message(s) at bottom of channel...", len(footers))
-	for idx, footer := range footers {
-		sentMsg, err := s.sendFooterTelegramMessage(channelID, footer)
-		if err != nil {
-			log.Printf("Error sending footer #%d (type: %s): %v", footer.ID, footer.MessageType, err)
-			continue
+				footer.TelegramMsgID = sentMsg.MessageID
+				s.db.Save(&footer)
+
+				footerRecord := models.ChannelMessage{
+					ChannelID:   channelID,
+					MessageID:   sentMsg.MessageID,
+					MessageType: "footer",
+					OrderIndex:  reqAlphabetCount + idx,
+					ContentHash: hashContent(footer.Content + footer.FileID),
+				}
+				s.db.Create(&footerRecord)
+				time.Sleep(ChannelPostDelay)
+			}
 		}
-
-		footer.TelegramMsgID = sentMsg.MessageID
-		s.db.Save(&footer)
-
-		footerRecord := models.ChannelMessage{
-			ChannelID:   channelID,
-			MessageID:   sentMsg.MessageID,
-			MessageType: "footer",
-			OrderIndex:  reqAlphabetCount + idx,
-			ContentHash: hashContent(footer.Content + footer.FileID),
-		}
-		s.db.Create(&footerRecord)
-		time.Sleep(ChannelPostDelay)
+	} else {
+		log.Println("No cascading or footer change: Footers preserved in place at bottom of channel.")
 	}
 
 	log.Println("Channel sync completed successfully.")
