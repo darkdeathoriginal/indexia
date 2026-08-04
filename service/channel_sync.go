@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"html"
 	"log"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,6 +19,8 @@ import (
 )
 
 const MaxMessageLength = 3800 // Safety buffer below Telegram 4096 char limit
+const ChannelPostDelay = 1500 * time.Millisecond // Telegram channel rate limit pacing (max ~20 msgs/min)
+const ChannelEditDelay = 250 * time.Millisecond  // Pacing for message edits
 
 type SyncService struct {
 	db        *gorm.DB
@@ -110,32 +113,31 @@ func (s *SyncService) SyncChannel(channelIDStr string) error {
 	log.Printf("Syncing channel %d: %d required pages (%d alphabet, %d footer), %d existing messages in DB",
 		channelID, len(allRequiredPages), len(pages), len(footerPages), len(existingMsgs))
 
-	// Check if cascading is required (i.e., required alphabet pages expanded or footer position needs delete/repost)
-	// Cascading Rule:
-	// If alphabet page count expanded, existing footer messages at bottom MUST be deleted from Telegram
-	// and newly created at the bottom after cascading alphabet pages.
+	// Check if cascading is required
+	// If alphabet page count expanded and footers exist, existing footer messages at bottom MUST be deleted from Telegram
+	// and re-created at the bottom after alphabet pages.
 	alphabetPageCount := len(pages)
 	prevAlphabetMsgCount := 0
+	hasExistingFooters := false
+
 	for _, m := range existingMsgs {
 		if m.MessageType == "alphabet" {
 			prevAlphabetMsgCount++
+		} else if m.MessageType == "footer" {
+			hasExistingFooters = true
 		}
 	}
 
-	needsCascading := alphabetPageCount > prevAlphabetMsgCount
+	needsCascading := prevAlphabetMsgCount > 0 && alphabetPageCount > prevAlphabetMsgCount && hasExistingFooters
 
 	if needsCascading {
 		log.Println("Cascading triggered: Alphabet page count increased. Deleting existing footer messages to re-post at bottom.")
-		// Delete any existing footer messages in Telegram
 		for _, m := range existingMsgs {
 			if m.MessageType == "footer" {
 				s.deleteTelegramMessage(channelID, m.MessageID)
 			}
 		}
-		// Clear footer tracked messages from DB so they get re-created below
 		s.db.Where("channel_id = ? AND message_type = ?", channelID, "footer").Delete(&models.ChannelMessage{})
-
-		// Re-fetch existing msgs (now only alphabet msgs)
 		s.db.Where("channel_id = ?", channelID).Order("order_index ASC").Find(&existingMsgs)
 	}
 
@@ -144,7 +146,6 @@ func (s *SyncService) SyncChannel(channelIDStr string) error {
 	currentCount := len(existingMsgs)
 
 	if reqCount > currentCount {
-		// Post additional new messages to channel
 		needed := reqCount - currentCount
 		log.Printf("Posting %d new message(s) to Telegram channel to expand capacity...", needed)
 
@@ -153,7 +154,7 @@ func (s *SyncService) SyncChannel(channelIDStr string) error {
 			msgConfig.ParseMode = "HTML"
 			sentMsg, err := s.sendTelegramMessage(msgConfig)
 			if err != nil {
-				return fmt.Errorf("failed to send initial channel message: %w", err)
+				return fmt.Errorf("failed to send initial channel message (%d/%d): %w", i+1, needed, err)
 			}
 
 			newMsgRecord := models.ChannelMessage{
@@ -165,10 +166,11 @@ func (s *SyncService) SyncChannel(channelIDStr string) error {
 			}
 			s.db.Create(&newMsgRecord)
 			existingMsgs = append(existingMsgs, newMsgRecord)
-			time.Sleep(100 * time.Millisecond) // smooth out API requests
+			
+			// Respect Telegram channel post rate limit (~20 posts/min)
+			time.Sleep(ChannelPostDelay)
 		}
 	} else if reqCount < currentCount {
-		// Delete surplus messages from the end of the channel
 		surplusCount := currentCount - reqCount
 		log.Printf("Deleting %d surplus message(s) from Telegram channel...", surplusCount)
 
@@ -176,7 +178,7 @@ func (s *SyncService) SyncChannel(channelIDStr string) error {
 			msgToDelete := existingMsgs[i]
 			s.deleteTelegramMessage(channelID, msgToDelete.MessageID)
 			s.db.Delete(&msgToDelete)
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(ChannelEditDelay)
 		}
 		existingMsgs = existingMsgs[:reqCount]
 	}
@@ -187,8 +189,8 @@ func (s *SyncService) SyncChannel(channelIDStr string) error {
 		msgRecord := &existingMsgs[idx]
 
 		if msgRecord.ContentHash != hash || msgRecord.MessageType != page.Type || msgRecord.Alphabet != page.Alphabet || msgRecord.Part != page.Part {
-			log.Printf("Updating message %d (Index %d, Type: %s, Alphabet: %s, Part: %d)...",
-				msgRecord.MessageID, idx, page.Type, page.Alphabet, page.Part)
+			log.Printf("Updating message %d (Index %d/%d, Type: %s, Alphabet: %s, Part: %d)...",
+				msgRecord.MessageID, idx+1, len(allRequiredPages), page.Type, page.Alphabet, page.Part)
 
 			editMsg := tgbotapi.NewEditMessageText(channelID, msgRecord.MessageID, page.Content)
 			editMsg.ParseMode = "HTML"
@@ -204,7 +206,7 @@ func (s *SyncService) SyncChannel(channelIDStr string) error {
 				msgRecord.ContentHash = hash
 				s.db.Save(msgRecord)
 			}
-			time.Sleep(150 * time.Millisecond)
+			time.Sleep(ChannelEditDelay)
 		}
 	}
 
@@ -238,15 +240,12 @@ func (s *SyncService) buildAlphabetPages(letter string, entries []models.Entry) 
 	}
 
 	for _, entry := range entries {
-		// Escape HTML special chars in name and URL
 		safeName := html.EscapeString(entry.Name)
 		safeURL := html.EscapeString(entry.URL)
 		line := fmt.Sprintf("• <a href=\"%s\">%s</a>", safeURL, safeName)
-
-		lineLen := len(line) + 1 // including newline
+		lineLen := len(line) + 1
 
 		if currentLen+lineLen > MaxMessageLength && len(currentLines) > 0 {
-			// Save current part
 			header := getHeader(part, true)
 			body := strings.Join(currentLines, "\n")
 			pages = append(pages, PreparedPage{
@@ -269,7 +268,6 @@ func (s *SyncService) buildAlphabetPages(letter string, entries []models.Entry) 
 		header := getHeader(part, isMulti)
 		body := strings.Join(currentLines, "\n")
 
-		// If it's multi-part, fix header of part 1 if previously created as single part
 		pages = append(pages, PreparedPage{
 			Type:     "alphabet",
 			Alphabet: letter,
@@ -278,7 +276,6 @@ func (s *SyncService) buildAlphabetPages(letter string, entries []models.Entry) 
 		})
 	}
 
-	// If there are multiple parts, adjust part 1 header if needed
 	if len(pages) > 1 {
 		pages[0].Content = strings.Replace(pages[0].Content,
 			fmt.Sprintf("<b>🔤 ALPHABET: %s</b>\n\n", letter),
@@ -307,33 +304,52 @@ func parseChannelID(str string) (int64, error) {
 	if id, err := strconv.ParseInt(str, 10, 64); err == nil {
 		return id, nil
 	}
-	return 0, fmt.Errorf("channel ID should be a numeric ID (e.g., -100123456789). Telegram username lookups require channel ID")
+	return 0, fmt.Errorf("channel ID should be a numeric ID (e.g., -100123456789). Telegram username lookups require numeric channel ID")
+}
+
+func getRetryDelay(err error, retryAttempt int) time.Duration {
+	if apiErr, ok := err.(tgbotapi.Error); ok {
+		if apiErr.ResponseParameters.RetryAfter > 0 {
+			return time.Duration(apiErr.ResponseParameters.RetryAfter+2) * time.Second
+		}
+	}
+	re := regexp.MustCompile(`retry after (\d+)`)
+	matches := re.FindStringSubmatch(err.Error())
+	if len(matches) > 1 {
+		if sec, parseErr := strconv.Atoi(matches[1]); parseErr == nil && sec > 0 {
+			return time.Duration(sec+2) * time.Second
+		}
+	}
+	return time.Duration((retryAttempt+1)*3) * time.Second
 }
 
 func (s *SyncService) sendTelegramMessage(config tgbotapi.MessageConfig) (tgbotapi.Message, error) {
-	for retries := 0; retries < 5; retries++ {
+	for retries := 0; retries < 10; retries++ {
 		msg, err := s.bot.Send(config)
 		if err != nil {
 			if strings.Contains(err.Error(), "Too Many Requests") || strings.Contains(err.Error(), "429") {
-				time.Sleep(time.Duration(retries+1) * 2 * time.Second)
+				delay := getRetryDelay(err, retries)
+				log.Printf("⚠️ Rate limited by Telegram when sending message. Waiting %v before retry %d/10...", delay, retries+1)
+				time.Sleep(delay)
 				continue
 			}
 			return msg, err
 		}
 		return msg, nil
 	}
-	return tgbotapi.Message{}, fmt.Errorf("failed after retries")
+	return tgbotapi.Message{}, fmt.Errorf("failed after 10 rate limit retries")
 }
 
 func (s *SyncService) editTelegramMessage(config tgbotapi.EditMessageTextConfig) error {
-	for retries := 0; retries < 5; retries++ {
+	for retries := 0; retries < 10; retries++ {
 		_, err := s.bot.Request(config)
 		if err != nil {
 			if strings.Contains(err.Error(), "Too Many Requests") || strings.Contains(err.Error(), "429") {
-				time.Sleep(time.Duration(retries+1) * 2 * time.Second)
+				delay := getRetryDelay(err, retries)
+				log.Printf("⚠️ Rate limited by Telegram when editing message %d. Waiting %v before retry %d/10...", config.MessageID, delay, retries+1)
+				time.Sleep(delay)
 				continue
 			}
-			// If message content is unchanged, Telegram returns an error which we can safely ignore
 			if strings.Contains(err.Error(), "message is not modified") {
 				return nil
 			}
@@ -341,16 +357,17 @@ func (s *SyncService) editTelegramMessage(config tgbotapi.EditMessageTextConfig)
 		}
 		return nil
 	}
-	return fmt.Errorf("failed to edit message after retries")
+	return fmt.Errorf("failed to edit message after 10 retries")
 }
 
 func (s *SyncService) deleteTelegramMessage(channelID int64, messageID int) {
 	deleteConfig := tgbotapi.NewDeleteMessage(channelID, messageID)
-	for retries := 0; retries < 3; retries++ {
+	for retries := 0; retries < 5; retries++ {
 		_, err := s.bot.Request(deleteConfig)
 		if err != nil {
 			if strings.Contains(err.Error(), "Too Many Requests") || strings.Contains(err.Error(), "429") {
-				time.Sleep(time.Duration(retries+1) * 2 * time.Second)
+				delay := getRetryDelay(err, retries)
+				time.Sleep(delay)
 				continue
 			}
 			log.Printf("Warning: failed to delete message %d: %v", messageID, err)
