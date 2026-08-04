@@ -116,7 +116,7 @@ func (b *Bot) handleHelp(msg *tgbotapi.Message, user *models.User) {
 
 <b>Channel & Footer Settings:</b>
 • <code>/setchannel &lt;ChannelID&gt;</code> - Set channel ID (e.g. -1001234567890)
-• <code>/addfooter &lt;text&gt;</code> - Add footer message below all alphabets
+• <code>/addfooter &lt;text&gt;</code> - Add footer message (or reply to a message with /addfooter)
 • <code>/clearfooters</code> - Clear all footer messages
 • <code>/sync</code> - Force trigger channel update & cascading sync
 
@@ -395,8 +395,18 @@ func (b *Bot) handleAddFooter(msg *tgbotapi.Message, user *models.User) {
 	}
 
 	text := strings.TrimSpace(msg.CommandArguments())
+
+	// If no inline argument, check if the command is a reply to another message
+	if text == "" && msg.ReplyToMessage != nil {
+		if msg.ReplyToMessage.Text != "" {
+			text = msg.ReplyToMessage.Text
+		} else if msg.ReplyToMessage.Caption != "" {
+			text = msg.ReplyToMessage.Caption
+		}
+	}
+
 	if text == "" {
-		b.replyHTML(msg.Chat.ID, "⚠️ <b>Usage:</b> <code>/addfooter Your footer text here</code>")
+		b.replyHTML(msg.Chat.ID, "⚠️ <b>Usage:</b>\n• <code>/addfooter Your footer text here</code>\n• Or reply to any message with <code>/addfooter</code>")
 		return
 	}
 
