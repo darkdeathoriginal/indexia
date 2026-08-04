@@ -5,8 +5,10 @@ import (
 	"html"
 	"log"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf16"
 
 	"indexia/models"
 
@@ -396,17 +398,17 @@ func (b *Bot) handleAddFooter(msg *tgbotapi.Message, user *models.User) {
 
 	text := strings.TrimSpace(msg.CommandArguments())
 
-	// If no inline argument, check if the command is a reply to another message
+	// If no inline argument, extract content from replied message if present
 	if text == "" && msg.ReplyToMessage != nil {
-		if msg.ReplyToMessage.Text != "" {
-			text = msg.ReplyToMessage.Text
-		} else if msg.ReplyToMessage.Caption != "" {
-			text = msg.ReplyToMessage.Caption
-		}
+		text = extractHTMLFromMessage(msg.ReplyToMessage)
 	}
 
 	if text == "" {
-		b.replyHTML(msg.Chat.ID, "⚠️ <b>Usage:</b>\n• <code>/addfooter Your footer text here</code>\n• Or reply to any message with <code>/addfooter</code>")
+		if msg.ReplyToMessage != nil {
+			b.replyHTML(msg.Chat.ID, "❌ <b>The replied message contains no text, caption, or emoji to use as a footer.</b>")
+		} else {
+			b.replyHTML(msg.Chat.ID, "⚠️ <b>Usage:</b>\n• <code>/addfooter Your footer text here</code>\n• Or reply to any message containing text/caption with <code>/addfooter</code>")
+		}
 		return
 	}
 
@@ -419,13 +421,135 @@ func (b *Bot) handleAddFooter(msg *tgbotapi.Message, user *models.User) {
 	}
 	b.db.Create(&footer)
 
-	b.replyHTML(msg.Chat.ID, "📌 <b>Footer message added!</b>\n\n<i>Syncing channel and re-positioning footers at bottom...</i>")
+	b.replyHTML(msg.Chat.ID, fmt.Sprintf("📌 <b>Footer message added!</b>\n\n<b>Content preview:</b>\n%s\n\n<i>Syncing channel and re-positioning footers at bottom...</i>", text))
 
 	go func() {
 		if err := b.syncSvc.SyncChannel(b.cfg.ChannelID); err != nil {
 			log.Printf("Sync error after adding footer: %v", err)
 		}
 	}()
+}
+
+func extractHTMLFromMessage(msg *tgbotapi.Message) string {
+	if msg == nil {
+		return ""
+	}
+
+	rawText := msg.Text
+	entities := msg.Entities
+	if rawText == "" {
+		rawText = msg.Caption
+		entities = msg.CaptionEntities
+	}
+
+	if rawText == "" && msg.Sticker != nil {
+		if msg.Sticker.Emoji != "" {
+			return msg.Sticker.Emoji
+		}
+		return "🎨 [Sticker]"
+	}
+
+	if rawText == "" {
+		return ""
+	}
+
+	if len(entities) == 0 {
+		return html.EscapeString(rawText)
+	}
+
+	u16 := utf16.Encode([]rune(rawText))
+
+	type tagItem struct {
+		isClose bool
+		html    string
+	}
+	tags := make(map[int][]tagItem)
+	offsetsMap := make(map[int]bool)
+	offsetsMap[0] = true
+	offsetsMap[len(u16)] = true
+
+	for _, entity := range entities {
+		var openTag, closeTag string
+		switch entity.Type {
+		case "bold":
+			openTag, closeTag = "<b>", "</b>"
+		case "italic":
+			openTag, closeTag = "<i>", "</i>"
+		case "underline":
+			openTag, closeTag = "<u>", "</u>"
+		case "strikethrough":
+			openTag, closeTag = "<s>", "</s>"
+		case "code":
+			openTag, closeTag = "<code>", "</code>"
+		case "pre":
+			openTag, closeTag = "<pre>", "</pre>"
+		case "text_link":
+			openTag, closeTag = fmt.Sprintf("<a href=\"%s\">", html.EscapeString(entity.URL)), "</a>"
+		case "url":
+			start := entity.Offset
+			end := entity.Offset + entity.Length
+			if start >= 0 && end <= len(u16) && start < end {
+				urlStr := string(utf16.Decode(u16[start:end]))
+				if !strings.HasPrefix(urlStr, "http://") && !strings.HasPrefix(urlStr, "https://") {
+					urlStr = "https://" + urlStr
+				}
+				openTag, closeTag = fmt.Sprintf("<a href=\"%s\">", html.EscapeString(urlStr)), "</a>"
+			}
+		default:
+			continue
+		}
+
+		start := entity.Offset
+		end := entity.Offset + entity.Length
+
+		if start < 0 {
+			start = 0
+		}
+		if end > len(u16) {
+			end = len(u16)
+		}
+		if start >= end {
+			continue
+		}
+
+		tags[start] = append(tags[start], tagItem{isClose: false, html: openTag})
+		tags[end] = append([]tagItem{{isClose: true, html: closeTag}}, tags[end]...)
+		offsetsMap[start] = true
+		offsetsMap[end] = true
+	}
+
+	var sortedOffsets []int
+	for off := range offsetsMap {
+		sortedOffsets = append(sortedOffsets, off)
+	}
+	sort.Ints(sortedOffsets)
+
+	var result strings.Builder
+	for i := 0; i < len(sortedOffsets); i++ {
+		off := sortedOffsets[i]
+
+		for _, t := range tags[off] {
+			if t.isClose {
+				result.WriteString(t.html)
+			}
+		}
+
+		for _, t := range tags[off] {
+			if !t.isClose {
+				result.WriteString(t.html)
+			}
+		}
+
+		if i+1 < len(sortedOffsets) {
+			nextOff := sortedOffsets[i+1]
+			if nextOff > off && nextOff <= len(u16) {
+				segment := string(utf16.Decode(u16[off:nextOff]))
+				result.WriteString(html.EscapeString(segment))
+			}
+		}
+	}
+
+	return result.String()
 }
 
 func (b *Bot) handleClearFooters(msg *tgbotapi.Message, user *models.User) {
